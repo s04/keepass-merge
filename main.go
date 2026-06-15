@@ -18,12 +18,18 @@ import (
 )
 
 type options struct {
-	InputDir    string
-	Output      string
-	RootName    string
-	Force       bool
-	SkipInvalid bool
-	Verbose     bool
+	InputDir         string
+	Output           string
+	RootName         string
+	Force            bool
+	PerFilePasswords bool
+	SkipInvalid      bool
+	Verbose          bool
+}
+
+type inputVault struct {
+	Path     string
+	Password string
 }
 
 type mergeStats struct {
@@ -48,6 +54,7 @@ func parseFlags() options {
 	flag.StringVar(&opts.Output, "output", "merged.kdbx", "path for the merged KeePass database")
 	flag.StringVar(&opts.RootName, "root-name", "Merged Root", "name of the root group in the merged database")
 	flag.BoolVar(&opts.Force, "force", false, "overwrite the output file if it already exists")
+	flag.BoolVar(&opts.PerFilePasswords, "per-file-passwords", false, "prompt for a separate input password for each database")
 	flag.BoolVar(&opts.SkipInvalid, "skip-invalid", false, "skip input databases that cannot be opened")
 	flag.BoolVar(&opts.Verbose, "verbose", false, "print per-file entry and group counts")
 	flag.Parse()
@@ -77,12 +84,12 @@ func run(opts options, stdin io.Reader, stdout io.Writer) error {
 		return fmt.Errorf("no .kdbx files found in %q", opts.InputDir)
 	}
 
-	inputPassword, outputPassword, err := readPasswords(stdin, stdout)
+	inputs, outputPassword, err := readPasswords(stdin, stdout, files, opts.PerFilePasswords)
 	if err != nil {
 		return err
 	}
 
-	stats, mergedDB, err := mergeFiles(files, inputPassword, outputPassword, opts.RootName, opts.SkipInvalid, opts.Verbose, stdout)
+	stats, mergedDB, err := mergeFiles(inputs, outputPassword, opts.RootName, opts.SkipInvalid, opts.Verbose, stdout)
 	if err != nil {
 		return err
 	}
@@ -127,34 +134,84 @@ func newPasswordPrompter(stdin io.Reader, stdout io.Writer) *passwordPrompter {
 	}
 }
 
-func readPasswords(stdin io.Reader, stdout io.Writer) (string, string, error) {
+func readPasswords(stdin io.Reader, stdout io.Writer, files []string, perFilePasswords bool) ([]inputVault, string, error) {
 	prompter := newPasswordPrompter(stdin, stdout)
+	if perFilePasswords {
+		return readPerFilePasswords(prompter, files)
+	}
+	return readSharedInputPassword(prompter, files)
+}
 
+func readSharedInputPassword(prompter *passwordPrompter, files []string) ([]inputVault, string, error) {
 	inputPassword, err := prompter.read("Input vault password: ")
 	if err != nil {
-		return "", "", err
+		return nil, "", err
 	}
 	if inputPassword == "" {
-		return "", "", errors.New("input vault password must not be empty")
+		return nil, "", errors.New("input vault password must not be empty")
 	}
 
-	outputPassword, err := prompter.read("Output vault password (leave blank to reuse input password): ")
+	outputPassword, err := readOutputPassword(prompter, inputPassword, "input password")
 	if err != nil {
-		return "", "", err
+		return nil, "", err
+	}
+
+	inputs := make([]inputVault, 0, len(files))
+	for _, file := range files {
+		inputs = append(inputs, inputVault{
+			Path:     file,
+			Password: inputPassword,
+		})
+	}
+	return inputs, outputPassword, nil
+}
+
+func readPerFilePasswords(prompter *passwordPrompter, files []string) ([]inputVault, string, error) {
+	inputs := make([]inputVault, 0, len(files))
+	var firstInputPassword string
+
+	for _, file := range files {
+		inputPassword, err := prompter.read(fmt.Sprintf("Input vault password for %s: ", filepath.Base(file)))
+		if err != nil {
+			return nil, "", err
+		}
+		if inputPassword == "" {
+			return nil, "", fmt.Errorf("input vault password for %s must not be empty", filepath.Base(file))
+		}
+		if firstInputPassword == "" {
+			firstInputPassword = inputPassword
+		}
+		inputs = append(inputs, inputVault{
+			Path:     file,
+			Password: inputPassword,
+		})
+	}
+
+	outputPassword, err := readOutputPassword(prompter, firstInputPassword, "the first input password")
+	if err != nil {
+		return nil, "", err
+	}
+	return inputs, outputPassword, nil
+}
+
+func readOutputPassword(prompter *passwordPrompter, fallbackPassword, fallbackLabel string) (string, error) {
+	outputPassword, err := prompter.read(fmt.Sprintf("Output vault password (leave blank to reuse %s): ", fallbackLabel))
+	if err != nil {
+		return "", err
 	}
 	if outputPassword == "" {
-		return inputPassword, inputPassword, nil
+		return fallbackPassword, nil
 	}
 
 	confirmedOutputPassword, err := prompter.read("Confirm output vault password: ")
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 	if outputPassword != confirmedOutputPassword {
-		return "", "", errors.New("output vault passwords do not match")
+		return "", errors.New("output vault passwords do not match")
 	}
 
-	return inputPassword, outputPassword, nil
+	return outputPassword, nil
 }
 
 func (p *passwordPrompter) read(prompt string) (string, error) {
@@ -176,22 +233,22 @@ func (p *passwordPrompter) read(prompt string) (string, error) {
 	return strings.TrimRight(password, "\r\n"), nil
 }
 
-func mergeFiles(files []string, inputPassword, outputPassword, rootName string, skipInvalid, verbose bool, stdout io.Writer) (mergeStats, *gokeepasslib.Database, error) {
+func mergeFiles(inputs []inputVault, outputPassword, rootName string, skipInvalid, verbose bool, stdout io.Writer) (mergeStats, *gokeepasslib.Database, error) {
 	stats := mergeStats{}
 	mergedDB := newDatabase(outputPassword, rootName)
 
-	for _, file := range files {
+	for _, input := range inputs {
 		if verbose {
-			fmt.Fprintf(stdout, "Processing file: %s\n", file)
+			fmt.Fprintf(stdout, "Processing file: %s\n", input.Path)
 		}
 
-		db, err := openDatabase(file, inputPassword)
+		db, err := openDatabase(input.Path, input.Password)
 		if err != nil {
 			if !skipInvalid {
-				return stats, nil, fmt.Errorf("opening %s: %w", file, err)
+				return stats, nil, fmt.Errorf("opening %s: %w", input.Path, err)
 			}
 			stats.FilesSkipped++
-			fmt.Fprintf(stdout, "Skipping %s: %v\n", file, err)
+			fmt.Fprintf(stdout, "Skipping %s: %v\n", input.Path, err)
 			continue
 		}
 

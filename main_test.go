@@ -192,6 +192,62 @@ func TestRunCanUseDifferentOutputPassword(t *testing.T) {
 	}
 }
 
+func TestRunCanUseDifferentInputPasswordsPerFile(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	outputPath := filepath.Join(tempDir, "merged.kdbx")
+	firstInputPassword := "first input password"
+	secondInputPassword := "second input password"
+	outputPassword := "output password"
+
+	if err := os.Mkdir(inputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestDatabase(t, filepath.Join(inputDir, "one.kdbx"), firstInputPassword, []gokeepasslib.Group{
+		{
+			Name:    "Personal",
+			Entries: []gokeepasslib.Entry{newEntry("Email", "entry-password")},
+		},
+	})
+	writeTestDatabase(t, filepath.Join(inputDir, "two.kdbx"), secondInputPassword, []gokeepasslib.Group{
+		{
+			Name:    "Work",
+			Entries: []gokeepasslib.Entry{newEntry("VPN", "vpn-password")},
+		},
+	})
+
+	var stdout bytes.Buffer
+	err := run(options{
+		InputDir:         inputDir,
+		Output:           outputPath,
+		RootName:         "Merged Test",
+		PerFilePasswords: true,
+	}, strings.NewReader(firstInputPassword+"\n"+secondInputPassword+"\n"+outputPassword+"\n"+outputPassword+"\n"), &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := openDatabase(outputPath, firstInputPassword); err == nil {
+		t.Fatal("expected first input password not to open output database")
+	}
+	if _, err := openDatabase(outputPath, secondInputPassword); err == nil {
+		t.Fatal("expected second input password not to open output database")
+	}
+
+	mergedDB, err := openDatabase(outputPath, outputPassword)
+	if err != nil {
+		t.Fatalf("expected output password to open output database: %v", err)
+	}
+
+	root := &mergedDB.Content.Root.Groups[0]
+	if findGroup(root, "Personal") == nil {
+		t.Fatal("expected Personal group from first input vault")
+	}
+	if findGroup(root, "Work") == nil {
+		t.Fatal("expected Work group from second input vault")
+	}
+}
+
 func TestRunRejectsMismatchedOutputPasswordConfirmation(t *testing.T) {
 	tempDir := t.TempDir()
 	inputDir := filepath.Join(tempDir, "input")
