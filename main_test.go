@@ -119,7 +119,7 @@ func TestRunMergesSyntheticKeePassDatabases(t *testing.T) {
 		InputDir: inputDir,
 		Output:   outputPath,
 		RootName: "Merged Test",
-	}, strings.NewReader(password+"\n"), &stdout)
+	}, strings.NewReader(password+"\n\n"), &stdout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,6 +154,101 @@ func TestRunMergesSyntheticKeePassDatabases(t *testing.T) {
 	work := findGroup(root, "Work")
 	if work == nil || findEntry(work, "VPN") == nil {
 		t.Fatal("expected Work/VPN entry")
+	}
+}
+
+func TestRunCanUseDifferentOutputPassword(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	outputPath := filepath.Join(tempDir, "merged.kdbx")
+	inputPassword := "input password"
+	outputPassword := "output password"
+
+	if err := os.Mkdir(inputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestDatabase(t, filepath.Join(inputDir, "one.kdbx"), inputPassword, []gokeepasslib.Group{
+		{
+			Name:    "Personal",
+			Entries: []gokeepasslib.Entry{newEntry("Email", "entry-password")},
+		},
+	})
+
+	var stdout bytes.Buffer
+	err := run(options{
+		InputDir: inputDir,
+		Output:   outputPath,
+		RootName: "Merged Test",
+	}, strings.NewReader(inputPassword+"\n"+outputPassword+"\n"+outputPassword+"\n"), &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := openDatabase(outputPath, inputPassword); err == nil {
+		t.Fatal("expected input password not to open output database")
+	}
+	if _, err := openDatabase(outputPath, outputPassword); err != nil {
+		t.Fatalf("expected output password to open output database: %v", err)
+	}
+}
+
+func TestRunRejectsMismatchedOutputPasswordConfirmation(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	outputPath := filepath.Join(tempDir, "merged.kdbx")
+	inputPassword := "input password"
+
+	if err := os.Mkdir(inputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestDatabase(t, filepath.Join(inputDir, "one.kdbx"), inputPassword, []gokeepasslib.Group{
+		{
+			Name:    "Personal",
+			Entries: []gokeepasslib.Entry{newEntry("Email", "entry-password")},
+		},
+	})
+
+	var stdout bytes.Buffer
+	err := run(options{
+		InputDir: inputDir,
+		Output:   outputPath,
+	}, strings.NewReader(inputPassword+"\nfirst output\nsecond output\n"), &stdout)
+	if err == nil {
+		t.Fatal("expected mismatched output password confirmation to fail")
+	}
+	if !strings.Contains(err.Error(), "output vault passwords do not match") {
+		t.Fatalf("expected password mismatch error, got %v", err)
+	}
+}
+
+func TestRunStopsWhenInputCannotBeOpened(t *testing.T) {
+	tempDir := t.TempDir()
+	inputDir := filepath.Join(tempDir, "input")
+	outputPath := filepath.Join(tempDir, "merged.kdbx")
+
+	if err := os.Mkdir(inputDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeTestDatabase(t, filepath.Join(inputDir, "one.kdbx"), "actual input password", []gokeepasslib.Group{
+		{
+			Name:    "Personal",
+			Entries: []gokeepasslib.Entry{newEntry("Email", "entry-password")},
+		},
+	})
+
+	var stdout bytes.Buffer
+	err := run(options{
+		InputDir: inputDir,
+		Output:   outputPath,
+	}, strings.NewReader("wrong input password\n\n"), &stdout)
+	if err == nil {
+		t.Fatal("expected unreadable input database to fail")
+	}
+	if !strings.Contains(err.Error(), "opening") {
+		t.Fatalf("expected opening error, got %v", err)
+	}
+	if _, statErr := os.Stat(outputPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected no output database to be written, stat error: %v", statErr)
 	}
 }
 

@@ -18,11 +18,12 @@ import (
 )
 
 type options struct {
-	InputDir string
-	Output   string
-	RootName string
-	Force    bool
-	Verbose  bool
+	InputDir    string
+	Output      string
+	RootName    string
+	Force       bool
+	SkipInvalid bool
+	Verbose     bool
 }
 
 type mergeStats struct {
@@ -47,6 +48,7 @@ func parseFlags() options {
 	flag.StringVar(&opts.Output, "output", "merged.kdbx", "path for the merged KeePass database")
 	flag.StringVar(&opts.RootName, "root-name", "Merged Root", "name of the root group in the merged database")
 	flag.BoolVar(&opts.Force, "force", false, "overwrite the output file if it already exists")
+	flag.BoolVar(&opts.SkipInvalid, "skip-invalid", false, "skip input databases that cannot be opened")
 	flag.BoolVar(&opts.Verbose, "verbose", false, "print per-file entry and group counts")
 	flag.Parse()
 	return opts
@@ -75,12 +77,12 @@ func run(opts options, stdin io.Reader, stdout io.Writer) error {
 		return fmt.Errorf("no .kdbx files found in %q", opts.InputDir)
 	}
 
-	password, err := readPassword(stdin, stdout)
+	inputPassword, outputPassword, err := readPasswords(stdin, stdout)
 	if err != nil {
 		return err
 	}
 
-	stats, mergedDB, err := mergeFiles(files, password, opts.RootName, opts.Verbose, stdout)
+	stats, mergedDB, err := mergeFiles(files, inputPassword, outputPassword, opts.RootName, opts.SkipInvalid, opts.Verbose, stdout)
 	if err != nil {
 		return err
 	}
@@ -111,36 +113,83 @@ func findKDBXFiles(inputDir string) ([]string, error) {
 	return files, nil
 }
 
-func readPassword(stdin io.Reader, stdout io.Writer) (string, error) {
-	fmt.Fprint(stdout, "Enter the password for the KeePass files: ")
+type passwordPrompter struct {
+	stdin    io.Reader
+	stdout   io.Writer
+	buffered *bufio.Reader
+}
 
-	if file, ok := stdin.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+func newPasswordPrompter(stdin io.Reader, stdout io.Writer) *passwordPrompter {
+	return &passwordPrompter{
+		stdin:    stdin,
+		stdout:   stdout,
+		buffered: bufio.NewReader(stdin),
+	}
+}
+
+func readPasswords(stdin io.Reader, stdout io.Writer) (string, string, error) {
+	prompter := newPasswordPrompter(stdin, stdout)
+
+	inputPassword, err := prompter.read("Input vault password: ")
+	if err != nil {
+		return "", "", err
+	}
+	if inputPassword == "" {
+		return "", "", errors.New("input vault password must not be empty")
+	}
+
+	outputPassword, err := prompter.read("Output vault password (leave blank to reuse input password): ")
+	if err != nil {
+		return "", "", err
+	}
+	if outputPassword == "" {
+		return inputPassword, inputPassword, nil
+	}
+
+	confirmedOutputPassword, err := prompter.read("Confirm output vault password: ")
+	if err != nil {
+		return "", "", err
+	}
+	if outputPassword != confirmedOutputPassword {
+		return "", "", errors.New("output vault passwords do not match")
+	}
+
+	return inputPassword, outputPassword, nil
+}
+
+func (p *passwordPrompter) read(prompt string) (string, error) {
+	fmt.Fprint(p.stdout, prompt)
+
+	if file, ok := p.stdin.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
 		passwordBytes, err := term.ReadPassword(int(file.Fd()))
-		fmt.Fprintln(stdout)
+		fmt.Fprintln(p.stdout)
 		if err != nil {
 			return "", fmt.Errorf("reading password: %w", err)
 		}
 		return string(passwordBytes), nil
 	}
 
-	password, err := bufio.NewReader(stdin).ReadString('\n')
+	password, err := p.buffered.ReadString('\n')
 	if err != nil && !errors.Is(err, io.EOF) {
 		return "", fmt.Errorf("reading password: %w", err)
 	}
 	return strings.TrimRight(password, "\r\n"), nil
 }
 
-func mergeFiles(files []string, password, rootName string, verbose bool, stdout io.Writer) (mergeStats, *gokeepasslib.Database, error) {
+func mergeFiles(files []string, inputPassword, outputPassword, rootName string, skipInvalid, verbose bool, stdout io.Writer) (mergeStats, *gokeepasslib.Database, error) {
 	stats := mergeStats{}
-	mergedDB := newDatabase(password, rootName)
+	mergedDB := newDatabase(outputPassword, rootName)
 
 	for _, file := range files {
 		if verbose {
 			fmt.Fprintf(stdout, "Processing file: %s\n", file)
 		}
 
-		db, err := openDatabase(file, password)
+		db, err := openDatabase(file, inputPassword)
 		if err != nil {
+			if !skipInvalid {
+				return stats, nil, fmt.Errorf("opening %s: %w", file, err)
+			}
 			stats.FilesSkipped++
 			fmt.Fprintf(stdout, "Skipping %s: %v\n", file, err)
 			continue
